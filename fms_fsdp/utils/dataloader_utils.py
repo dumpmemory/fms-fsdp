@@ -1,13 +1,12 @@
 import torch
-from torch.utils.data.distributed import DistributedSampler
 
 from fms_fsdp.utils.dataset_utils import (
     Buffer_Dataset,
+    Checkpoint_Dataset,
     Preload_Buffer_Dataset,
     Preprocess_Dataset,
     Sampling_Dataset,
     Scalable_Shard_Dataset,
-    Streaming_Doc_Dataset,
 )
 
 
@@ -37,7 +36,8 @@ def get_dummy_loader(cfg, rank, world_size):
 
 def get_data_loader(cfg, rank, world_size):
     """
-    Pytorch dataloader for stateful, distributed, and rescalable causal language model (CLM) training
+    Pytorch dataloader for stateful, distributed, and rescalable causal language model (CLM) training.
+    Assumes underlying data is sequences of integer values.
     ...
     Args
     ----
@@ -51,7 +51,7 @@ def get_data_loader(cfg, rank, world_size):
 
     datasets, weights = parse_data_args(cfg.datasets, cfg.weights)
 
-    def causal_lm(data_seq, prompt_len=1):
+    def causal_lm(data_seq, prompt_len=0):
         """
         Perform causal language modeling by right-shifting the input sequence.
         Sets first prompt_len tokens to be ignored by the loss.
@@ -64,12 +64,18 @@ def get_data_loader(cfg, rank, world_size):
 
     # Base streaming dataset. Returns doc chunks in sequence.
     # Implements dataset sampling and rescalability.
+    droplist = [
+        int(x.strip()) for x in cfg.strip_tokens.split(",") if len(x.strip()) > 0
+    ]
+    droplist = droplist + [cfg.bos_token, cfg.eos_token, cfg.bol_token, cfg.eol_token]
     data = Sampling_Dataset(
         cfg.data_path,
         Scalable_Shard_Dataset,
         rank,
         world_size,
-        cfg.sep_token,
+        cfg.eos_token,
+        bos_token=cfg.bos_token,
+        strip_tokens=set(droplist),
         min_length=3,
         datasets=datasets,
         weights=weights,
@@ -81,15 +87,23 @@ def get_data_loader(cfg, rank, world_size):
     data = Buffer_Dataset(
         data,
         cfg.seq_length + 1,
-        drop_final_token=cfg.sep_token,
+        bos_token=cfg.bol_token,
+        eos_token=cfg.eol_token,
         pack_hard=True,
     )
     # Shuffle outputs in length 10k buffer. Consecutive lines appear 10k steps apart on average.
     data = Preload_Buffer_Dataset(data, 10000)
     # Split line into input and target for the CLM task.
     data = Preprocess_Dataset(data, causal_lm)
-
-    return torch.utils.data.DataLoader(data, num_workers=0, batch_size=cfg.batch_size)
+    # Enable auto-saving
+    data = Checkpoint_Dataset(
+        data,
+        cfg.ckpt_load_path,
+        cfg.checkpoint_interval,
+        cfg.batch_size,
+        cfg.ckpt_save_path,
+    )
+    return torch.utils.data.DataLoader(data, num_workers=1, batch_size=cfg.batch_size)
 
 
 def parse_data_args(datas, weights):
